@@ -7,6 +7,7 @@
 #include <boost/property_tree/ptree.hpp>
 #include <boost/property_tree/json_parser.hpp>
 
+#include <nlohmann/json.hpp>
 #include "libslic3r/PrintConfig.hpp"
 #include "slic3r/GUI/I18N.hpp"
 #include "slic3r/GUI/GUI.hpp"
@@ -308,12 +309,91 @@ bool Moonraker::upload(PrintHostUpload upload_data, ProgressFn progress_fn, Erro
 
     if (upload_data.post_action == PrintHostPostUploadAction::StartPrint && !uploaded_path.empty()) {
         wxString start_msg;
-        if (!start_print(start_msg, uploaded_path)) {
+        if (!start_print(start_msg, uploaded_path, upload_data.extended_info)) {
             error_fn(std::move(start_msg));
             return false;
         }
     }
     return true;
+}
+
+bool Moonraker::start_print(wxString &error_msg, const std::string &filename, const std::map<std::string, std::string>& extended_info) const
+{
+    auto it_is_sm = extended_info.find("is_snapmaker");
+    bool is_snapmaker = (it_is_sm != extended_info.end() && it_is_sm->second == "1");
+
+    if (!is_snapmaker) {
+        return start_print(error_msg, filename);
+    }
+
+    const char *name = get_name();
+    bool res = true;
+    auto url = make_url("server/jsonrpc");
+
+    nlohmann::json print_task_config = nlohmann::json::object();
+    
+    auto it_abl = extended_info.find("auto_bed_leveling");
+    bool auto_bed_leveling = (it_abl != extended_info.end() && it_abl->second == "1");
+    print_task_config["auto_bed_leveling"] = auto_bed_leveling;
+
+    auto it_flow = extended_info.find("flow_calibrate");
+    bool flow_calibrate = (it_flow != extended_info.end() && it_flow->second == "1");
+    print_task_config["flow_calibrate"] = flow_calibrate;
+
+    print_task_config["shaper_calibrate"] = false;
+
+    std::vector<int> extruder_map_table;
+    for (int i = 0; ; i++) {
+        auto it_map = extended_info.find("colorMatch_" + std::to_string(i));
+        if (it_map == extended_info.end())
+            break;
+        try {
+            extruder_map_table.push_back(std::stoi(it_map->second));
+        } catch (...) {
+            extruder_map_table.push_back(-1);
+        }
+    }
+    if (!extruder_map_table.empty()) {
+        print_task_config["extruder_map_table"] = extruder_map_table;
+    }
+
+    nlohmann::json rpc_params = {
+        {"path", filename},
+        {"type", "local"},
+        {"print_task_config", print_task_config}
+    };
+
+    nlohmann::json json_rpc = {
+        {"jsonrpc", "2.0"},
+        {"method", "server.files.start_local_print"},
+        {"params", rpc_params},
+        {"id", 1}
+    };
+
+    std::string body = json_rpc.dump();
+
+    BOOST_LOG_TRIVIAL(info) << boost::format("%1%: Starting Snapmaker print of %2% at %3%") % name % filename % url;
+    BOOST_LOG_TRIVIAL(debug) << boost::format("%1%: Snapmaker print payload: %2%") % name % body;
+
+    auto http = Http::post(std::move(url));
+    set_auth(http);
+    http.header("Content-Type", "application/json")
+        .set_post_body(body)
+        .on_complete([&](std::string body, unsigned status) {
+            BOOST_LOG_TRIVIAL(debug) << boost::format("%1%: start_local_print HTTP %2%: %3%") % name % status % body;
+        })
+        .on_error([&](std::string body, std::string error, unsigned status) {
+            BOOST_LOG_TRIVIAL(error) << boost::format("%1%: Error starting Snapmaker print at %2%: %3%, HTTP %4%, body: `%5%`")
+                % name % url % error % status % body;
+            res = false;
+            error_msg = format_error(body, error, status);
+        })
+#ifdef WIN32
+        .ssl_revoke_best_effort(m_ssl_revoke_best_effort)
+#endif
+        .perform_sync();
+
+    return res;
 }
 
 }
